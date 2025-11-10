@@ -7,17 +7,17 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-// ---------- 環境變數檢查 ----------
+// ---------- 檢查環境變數 ----------
 ["OPENAI_API_KEY", "LINE_CHANNEL_TOKEN"].forEach((k) => {
-  if (!process.env[k]) {
-    console.warn(`[warn] env ${k} is empty!`);
-  }
+  if (!process.env[k]) console.warn(`[⚠️ warn] env ${k} is empty!`);
 });
 
-// ---------- OpenAI ----------
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// ---------- 初始化 OpenAI ----------
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-// 產生 AI 回覆（使用 Responses API 正確結構）
+// ---------- AI 處理 ----------
 async function askCoach(userText) {
   try {
     const r = await client.responses.create({
@@ -27,26 +27,25 @@ async function askCoach(userText) {
           role: "system",
           content: [
             {
-              type: "text",
+              type: "input_text",
               text:
-                "你是「Mind Coach」。用繁中、溫和、務實回覆：1) 同理一句 2) 建議一句 3) 鼓勵一句（120字內，短句、正向、有溫度，可加 emoji）。",
+                "你是「Mind Coach」。請用繁中、溫和、有溫度的語氣回覆。每次回應包含：1️⃣ 同理一句 2️⃣ 建議一句 3️⃣ 鼓勵一句（不超過120字，可加 emoji）。",
             },
           ],
         },
         {
           role: "user",
-          content: [{ type: "text", text: userText }],
+          content: [{ type: "input_text", text: userText }],
         },
       ],
     });
 
-    // 取出文字（Responses API 最保險的取法）
-    const textOut =
-      r.output_text?.trim() ||
-      r.output?.[0]?.content?.[0]?.text?.value?.trim() ||
+    // 取出回覆內容（新版 Responses API）
+    const reply =
+      r.output?.[0]?.content?.[0]?.output_text?.trim() ||
       "我在這裡，願意聽你說 🙂";
 
-    return textOut;
+    return reply;
   } catch (err) {
     console.error("❌ OpenAI 呼叫失敗：", err.response?.data || err);
     return "我剛剛有點塞車，能再說一次嗎？🙂";
@@ -66,7 +65,6 @@ app.post("/line/webhook", async (req, res) => {
         const replyText = await askCoach(userText);
         console.log("🤖 AI 回覆：", replyText);
 
-        // 回傳給 LINE
         await axios.post(
           "https://api.line.me/v2/bot/message/reply",
           {
