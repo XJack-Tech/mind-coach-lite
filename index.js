@@ -1,126 +1,99 @@
 import express from "express";
-import bodyParser from "body-parser";
-import dotenv from "dotenv";
-import OpenAI from "openai";
 import axios from "axios";
-
+import OpenAI from "openai";
+import dotenv from "dotenv";
 dotenv.config();
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+const app = express();
+app.use(express.json());
+
+// ---------- 環境變數檢查 ----------
+["OPENAI_API_KEY", "LINE_CHANNEL_TOKEN"].forEach((k) => {
+  if (!process.env[k]) {
+    console.warn(`[warn] env ${k} is empty!`);
+  }
 });
 
-// 讓回覆更口語＆帶 emoji 的對照表
-const emotionEmoji = {
-  喜悅: "😊",
-  開心: "😊",
-  放鬆: "😌",
-  平靜: "🫶",
-  緊張: "😬",
-  焦慮: "😟",
-  難過: "😢",
-  生氣: "😠",
-  挫折: "🥲",
-  沮喪: "😞",
-  擔心: "😰",
-};
+// ---------- OpenAI ----------
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const schema = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    emotion: { type: "string" },
-    score: { type: "number" },
-    triggers: { type: "array", items: { type: "string" }, maxItems: 3 },
-    advice: { type: "string", maxLength: 120 },
-    rewrite: { type: "string", maxLength: 60 },
-  },
-  required: ["emotion", "score", "advice", "rewrite"],
-};
-
-// 產生帶 emoji 的回覆文字
-function formatReply(out = {}) {
-  const emo = out.emotion || "-";
-  const emoIcon =
-    emotionEmoji[emo] ||
-    (emo.includes("喜") || emo.includes("樂") ? "😊" : "🫶");
-
-  const scoreIcon =
-    out.score >= 80 ? "🌟" : out.score >= 60 ? "👍" : out.score >= 40 ? "🧭" : "🤝";
-
-  return (
-    `${emoIcon} 情緒：${emo}\n` +
-    `${scoreIcon} 分數：${out.score ?? "-"} / 100\n` +
-    `💡 建議：${out.advice ?? "-"}\n` +
-    `✍️ 重寫：${out.rewrite ?? "-"}`
-  );
-}
-
-async function askCoach(text) {
-  const r = await client.responses.create({
-    model: "gpt-4o-mini",
-    input: [
-      {
-        role: "system",
-        content:
-          "你是「Mind Coach」。用繁中、溫和、務實：1) emotion 2) score(0-100) 3) triggers(<=3詞) 4) advice<120字 5) rewrite<60字；短句、正向、不說教。",
-      },
-      { role: "user", content: text },
-    ],
-    text: {
-      format: "json_schema",
-      json_schema: { name: "MindCoach", schema, strict: true },
-    },
-  });
-
-  const out = r.output_parsed || {};
-  return formatReply(out);
-}
-
-const app = express();
-app.use(bodyParser.json());
-
-// 健康檢查
-app.get("/", (_req, res) => res.send("OK"));
-
-// LINE webhook
-app.post("/line/webhook", async (req, res) => {
-  const events = req.body?.events || [];
-
-  for (const event of events) {
-    if (event.type !== "message" || event.message?.type !== "text") continue;
-
-    const userText = event.message.text;
-    let replyText = "✅ 我收到你的訊息囉～";
-
-    try {
-      replyText = await askCoach(userText);
-    } catch (error) {
-      console.error("❌ AI 回覆錯誤：", error.response?.data || error);
-    }
-
-    try {
-      await axios.post(
-        "https://api.line.me/v2/bot/message/reply",
+// 產生 AI 回覆（使用 Responses API 正確結構）
+async function askCoach(userText) {
+  try {
+    const r = await client.responses.create({
+      model: "gpt-4o-mini",
+      input: [
         {
-          replyToken: event.replyToken,
-          messages: [{ type: "text", text: replyText }],
+          role: "system",
+          content: [
+            {
+              type: "text",
+              text:
+                "你是「Mind Coach」。用繁中、溫和、務實回覆：1) 同理一句 2) 建議一句 3) 鼓勵一句（120字內，短句、正向、有溫度，可加 emoji）。",
+            },
+          ],
         },
         {
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${process.env.LINE_CHANNEL_TOKEN}`,
-          },
-        }
-      );
-    } catch (error) {
-      console.error("❌ LINE 回覆 API 錯誤：", error.response?.data || error);
-    }
-  }
+          role: "user",
+          content: [{ type: "text", text: userText }],
+        },
+      ],
+    });
 
-  res.sendStatus(200);
+    // 取出文字（Responses API 最保險的取法）
+    const textOut =
+      r.output_text?.trim() ||
+      r.output?.[0]?.content?.[0]?.text?.value?.trim() ||
+      "我在這裡，願意聽你說 🙂";
+
+    return textOut;
+  } catch (err) {
+    console.error("❌ OpenAI 呼叫失敗：", err.response?.data || err);
+    return "我剛剛有點塞車，能再說一次嗎？🙂";
+  }
+}
+
+// ---------- LINE Webhook ----------
+app.post("/line/webhook", async (req, res) => {
+  try {
+    const events = req.body?.events || [];
+
+    for (const event of events) {
+      if (event.type === "message" && event.message?.type === "text") {
+        const userText = event.message.text;
+        console.log("💬 收到使用者訊息：", userText);
+
+        const replyText = await askCoach(userText);
+        console.log("🤖 AI 回覆：", replyText);
+
+        // 回傳給 LINE
+        await axios.post(
+          "https://api.line.me/v2/bot/message/reply",
+          {
+            replyToken: event.replyToken,
+            messages: [{ type: "text", text: replyText }],
+          },
+          {
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${process.env.LINE_CHANNEL_TOKEN}`,
+            },
+          }
+        );
+      }
+    }
+
+    res.sendStatus(200);
+  } catch (error) {
+    console.error("❌ LINE 回覆 API 錯誤：", error.response?.data || error);
+    res.sendStatus(500);
+  }
 });
 
+// ---------- 健康檢查 ----------
+app.get("/", (_req, res) => res.send("OK"));
+
+// ---------- 啟動 ----------
 app.listen(process.env.PORT || 3000, () => {
-  console.log("Mind Coach Lite ready");
+  console.log("✅ Mind Coach Lite ready");
 });
