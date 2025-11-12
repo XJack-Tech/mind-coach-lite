@@ -2,96 +2,205 @@ import express from "express";
 import axios from "axios";
 import OpenAI from "openai";
 import dotenv from "dotenv";
+import crypto from "crypto";
 dotenv.config();
 
 const app = express();
-app.use(express.json());
 
-// ---------- 檢查環境變數 ----------
-["OPENAI_API_KEY", "LINE_CHANNEL_TOKEN"].forEach((k) => {
+// -------- 基本設定 --------
+["OPENAI_API_KEY", "LINE_CHANNEL_TOKEN", "LINE_CHANNEL_SECRET"].forEach((k) => {
   if (!process.env[k]) console.warn(`[⚠️ warn] env ${k} is empty!`);
 });
 
-// ---------- 初始化 OpenAI ----------
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ---------- AI 處理 ----------
+// -------- LINE 驗簽需 raw body --------
+app.post(
+  "/line/webhook",
+  express.raw({ type: "application/json" }), // 取得原始 body（Buffer）
+  (req, res, next) => {
+    const signature = req.headers["x-line-signature"];
+    if (!signature) return res.sendStatus(400);
+
+    const hmac = crypto
+      .createHmac("sha256", process.env.LINE_CHANNEL_SECRET || "")
+      .update(req.body) // Buffer 原文
+      .digest("base64");
+
+    if (hmac !== signature) return res.sendStatus(403);
+
+    // 驗簽通過後把 body 轉回物件
+    try {
+      req.body = JSON.parse(req.body.toString("utf8"));
+    } catch {
+      return res.sendStatus(400);
+    }
+    next();
+  },
+  async (req, res) => {
+    try {
+      const events = req.body?.events || [];
+      if (!Array.isArray(events) || events.length === 0) return res.sendStatus(200);
+
+      for (const event of events) {
+        const replyToken = event.replyToken;
+        if (!replyToken) continue;
+
+        if (event.type === "message" && event.message?.type === "text") {
+          const userText = (event.message.text || "").slice(0, 1000);
+          console.log("💬 使用者：", userText);
+
+          const replyText = await askCoach(userText);
+          console.log("🧠 AI raw =", replyText);
+          await sendLineReply(replyToken, replyText);
+        } else {
+          await sendLineReply(
+            replyToken,
+            "目前先支援文字訊息（貼圖/圖片我暫時看不到），想跟我聊聊嗎？📝"
+          );
+        }
+      }
+      res.sendStatus(200);
+    } catch (error) {
+      console.error("❌ LINE webhook 處理錯誤：", error?.response?.data || error);
+      res.sendStatus(500);
+    }
+  }
+);
+
+// -------- OpenAI 回覆（穩定+診斷）--------
 async function askCoach(userText) {
   try {
-    const r = await client.responses.create({
+    const input = (userText || "").toString().slice(0, 1000);
+
+    const completion = await client.chat.completions.create({
       model: "gpt-4o-mini",
-      input: [
+      messages: [
         {
           role: "system",
-          content: [
-            {
-              type: "input_text",
-              text:
-                "你是「Mind Coach」。請用繁中、溫和、有溫度的語氣回覆。每次回應包含：1️⃣ 同理一句 2️⃣ 建議一句 3️⃣ 鼓勵一句（不超過120字，可加 emoji）。",
-            },
-          ],
+          content:
+            "你是「Mind Coach」。請用繁中、溫和、有溫度的語氣回覆。每次回應包含：1️⃣ 同理一句 2️⃣ 建議一句 3️⃣ 鼓勵一句（不超過120字，可加 emoji）。"
         },
-        {
-          role: "user",
-          content: [{ type: "input_text", text: userText }],
-        },
+        { role: "user", content: input }
       ],
+      temperature: 0.7,
+      max_tokens: 150,
+      timeout: 8000
     });
 
-    // 取出回覆內容（新版 Responses API）
-    const reply =
-      r.output?.[0]?.content?.[0]?.output_text?.trim() ||
-      "我在這裡，願意聽你說 🙂";
+    const ai = completion.choices?.[0]?.message?.content?.trim();
+    if (ai) return ai;
 
-    return reply;
+    console.warn("⚠️ AI empty, use fallback");
+    return randomFallback(input);
   } catch (err) {
-    console.error("❌ OpenAI 呼叫失敗：", err.response?.data || err);
-    return "我剛剛有點塞車，能再說一次嗎？🙂";
+    const code = err?.code || err?.error?.code;
+    const status = err?.status || err?.response?.status;
+    const data = err?.response?.data;
+    console.error("❌ OpenAI error detail:", { code, status, data });
+
+    if (code === "insufficient_quota" || status === 429) {
+      return "AI 額度暫時用完了，但我在這裡陪你。想說說看發生了什麼嗎？🙂";
+    }
+    return "剛剛有點塞車，再說一次也可以喔 🙂";
   }
 }
 
-// ---------- LINE Webhook ----------
-app.post("/line/webhook", async (req, res) => {
-  try {
-    const events = req.body?.events || [];
+function randomFallback(seed = "") {
+  const fallbacks = [
+    "我在，先陪你一下。想從哪一段開始說呢？🙂",
+    "我懂，你先深呼吸，我在這裡聽你說。🙂",
+    "辛苦了，我願意陪你聊聊。你最在意的是哪件事？🙂",
+    "收到，我在。說說現在最困擾你的點吧。🙂",
+    "我在旁邊，慢慢來。我們一步一步整理。🙂"
+  ];
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  return fallbacks[h % fallbacks.length];
+}
 
-    for (const event of events) {
-      if (event.type === "message" && event.message?.type === "text") {
-        const userText = event.message.text;
-        console.log("💬 收到使用者訊息：", userText);
+// -------- LINE 回覆（含 429/5xx 自動重試）--------
+async function sendLineReply(replyToken, text) {
+  const payload = { replyToken, messages: [{ type: "text", text }] };
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${process.env.LINE_CHANNEL_TOKEN}`
+  };
 
-        const replyText = await askCoach(userText);
-        console.log("🤖 AI 回覆：", replyText);
-
-        await axios.post(
-          "https://api.line.me/v2/bot/message/reply",
-          {
-            replyToken: event.replyToken,
-            messages: [{ type: "text", text: replyText }],
-          },
-          {
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${process.env.LINE_CHANNEL_TOKEN}`,
-            },
-          }
-        );
+  const maxRetries = 2;
+  for (let i = 0; i <= maxRetries; i++) {
+    try {
+      await axios.post("https://api.line.me/v2/bot/message/reply", payload, {
+        headers,
+        timeout: 10000
+      });
+      return;
+    } catch (err) {
+      const status = err?.response?.status;
+      if (i < maxRetries && (status === 429 || (status >= 500 && status < 600))) {
+        const backoff = 300 * (i + 1);
+        await new Promise((r) => setTimeout(r, backoff));
+        continue;
       }
+      console.error("❌ LINE 回覆失敗：", err?.response?.data || err);
+      throw err;
     }
+  }
+}
 
-    res.sendStatus(200);
-  } catch (error) {
-    console.error("❌ LINE 回覆 API 錯誤：", error.response?.data || error);
-    res.sendStatus(500);
+// -------- 健康/診斷/直接測 AI --------
+app.get("/", (_req, res) => res.send("Mind Coach Lite OK"));
+
+app.get("/_health", (_req, res) => {
+  res.json({
+    status: "ok",
+    uptime: process.uptime(),
+    node: process.version,
+    hasOpenAIKey: !!process.env.OPENAI_API_KEY,
+    hasLineToken: !!process.env.LINE_CHANNEL_TOKEN,
+    hasLineSecret: !!process.env.LINE_CHANNEL_SECRET,
+    commit: process.env.RENDER_GIT_COMMIT || "unknown"
+  });
+});
+
+app.get("/_diag", (_req, res) => {
+  res.json({
+    node: process.version,
+    hasOpenAIKey: !!process.env.OPENAI_API_KEY,
+    hasLineToken: !!process.env.LINE_CHANNEL_TOKEN,
+    hasLineSecret: !!process.env.LINE_CHANNEL_SECRET
+  });
+});
+
+app.get("/test-ai", async (req, res) => {
+  try {
+    const text = (req.query.text || "測試").toString().slice(0, 200);
+    const r = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "請用繁中回覆，一句話即可。" },
+        { role: "user", content: text }
+      ],
+      max_tokens: 60,
+      temperature: 0.7
+    });
+    const ai = r.choices?.[0]?.message?.content?.trim();
+    res.json({ ok: true, ai });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      code: err?.code || err?.error?.code,
+      status: err?.status || err?.response?.status,
+      data: err?.response?.data || String(err)
+    });
   }
 });
 
-// ---------- 健康檢查 ----------
-app.get("/", (_req, res) => res.send("OK"));
-
-// ---------- 啟動 ----------
-app.listen(process.env.PORT || 3000, () => {
+// -------- 啟動＆優雅關機 --------
+const server = app.listen(process.env.PORT || 3000, () => {
   console.log("✅ Mind Coach Lite ready");
+});
+process.on("SIGTERM", () => {
+  console.log("⏳ Shutting down...");
+  server.close(() => process.exit(0));
 });
