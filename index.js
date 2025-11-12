@@ -73,20 +73,23 @@ async function askCoach(userText) {
   try {
     const input = (userText || "").toString().slice(0, 1000);
 
-    const completion = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            "你是「Mind Coach」。請用繁中、溫和、有溫度的語氣回覆。每次回應包含：1️⃣ 同理一句 2️⃣ 建議一句 3️⃣ 鼓勵一句（不超過120字，可加 emoji）。"
-        },
-        { role: "user", content: input }
-      ],
-      temperature: 0.7,
-      max_tokens: 150,
-      timeout: 8000
-    });
+    // ✅ timeout 放在第二個參數
+    const completion = await client.chat.completions.create(
+      {
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content:
+              "你是「Mind Coach」。請用繁中、溫和、有溫度的語氣回覆。每次回應包含：1️⃣ 同理一句 2️⃣ 建議一句 3️⃣ 鼓勵一句（不超過120字，可加 emoji）。"
+          },
+          { role: "user", content: input }
+        ],
+        temperature: 0.7,
+        max_tokens: 150
+      },
+      { timeout: 8000 }
+    );
 
     const ai = completion.choices?.[0]?.message?.content?.trim();
     if (ai) return ai;
@@ -96,8 +99,9 @@ async function askCoach(userText) {
   } catch (err) {
     const code = err?.code || err?.error?.code;
     const status = err?.status || err?.response?.status;
-    const data = err?.response?.data;
-    console.error("❌ OpenAI error detail:", { code, status, data });
+    const msg =
+      err?.response?.data?.error?.message || err?.message || JSON.stringify(err);
+    console.error("❌ OpenAI error detail:", { code, status, msg });
 
     if (code === "insufficient_quota" || status === 429) {
       return "AI 額度暫時用完了，但我在這裡陪你。想說說看發生了什麼嗎？🙂";
@@ -175,24 +179,26 @@ app.get("/_diag", (_req, res) => {
 app.get("/test-ai", async (req, res) => {
   try {
     const text = (req.query.text || "測試").toString().slice(0, 200);
-    const r = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: "請用繁中回覆，一句話即可。" },
-        { role: "user", content: text }
-      ],
-      max_tokens: 60,
-      temperature: 0.7
-    });
+    const r = await client.chat.completions.create(
+      {
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: "請用繁中回覆，一句話即可。" },
+          { role: "user", content: text }
+        ],
+        max_tokens: 60,
+        temperature: 0.7
+      },
+      { timeout: 8000 } // 同樣放第二個參數
+    );
     const ai = r.choices?.[0]?.message?.content?.trim();
     res.json({ ok: true, ai });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      code: err?.code || err?.error?.code,
-      status: err?.status || err?.response?.status,
-      data: err?.response?.data || String(err)
-    });
+    const code = err?.code || err?.error?.code;
+    const status = err?.status || err?.response?.status;
+    const msg =
+      err?.response?.data?.error?.message || err?.message || JSON.stringify(err);
+    res.status(500).json({ ok: false, code, status, msg });
   }
 });
 
