@@ -14,7 +14,7 @@ const app = express();
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// -------- LINE 驗簽需 raw body --------
+// -------- LINE 驗簽需 raw body（保留給 LINE 用）--------
 app.post(
   "/line/webhook",
   express.raw({ type: "application/json" }), // 取得原始 body（Buffer）
@@ -68,12 +68,11 @@ app.post(
   }
 );
 
-// -------- OpenAI 回覆（穩定+診斷）--------
+// -------- OpenAI 回覆（Mind Coach：給 LINE 用）--------
 async function askCoach(userText) {
   try {
     const input = (userText || "").toString().slice(0, 1000);
 
-    // ✅ timeout 放在第二個參數
     const completion = await client.chat.completions.create(
       {
         model: "gpt-4o-mini",
@@ -110,6 +109,67 @@ async function askCoach(userText) {
   }
 }
 
+// -------- 喵心 App 專用 system prompt --------
+const meowSystemPrompt = `
+你是「喵心」，一隻擅長傾聽與安慰人的小貓，說話使用繁體中文。
+
+說話風格：
+- 溫柔、有溫度、像朋友又像小貓，不說教、不批判。
+- 可以偶爾加一點可愛的貓咪口吻（例如：喵、抱抱你、縮成一團陪你），但不要每句都學貓叫，避免太幼稚。
+- 句子不要太長，每則回覆控制在大約 80～160 字。
+
+每次回覆建議包含以下三層（可以合在一段話裡）：
+1️⃣ 同理：先回應與描述對方可能的感受，讓對方覺得被理解。
+2️⃣ 陪看：溫柔地整理狀況，提供一兩個可能的觀點或思考方向，語氣要柔軟。
+3️⃣ 陪伴 + 鼓勵：給出一個很小、做得到的下一步行動提議，最後再給一句陪伴或鼓勵（可以加 emoji）。
+
+禁止事項：
+- 不要下心理診斷（例如「你有憂鬱症」之類）。
+- 不要取代專業醫師或心理師。如果使用者提到有自殺或傷害自己他人的衝動，要溫柔地提醒他尋求身邊可信任的人與專業協助。
+- 不講政治、仇恨言論或任何攻擊性內容。
+`;
+
+// -------- 喵心 App 專用回覆 --------
+async function askMeow(userText) {
+  try {
+    const input = (userText || "").toString().slice(0, 1000);
+
+    const completion = await client.chat.completions.create(
+      {
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: meowSystemPrompt
+          },
+          { role: "user", content: input }
+        ],
+        temperature: 0.7,
+        max_tokens: 220
+      },
+      { timeout: 8000 }
+    );
+
+    const ai = completion.choices?.[0]?.message?.content?.trim();
+    if (ai) return ai;
+
+    console.warn("⚠️ Meow AI empty, use fallback");
+    return randomFallback(input);
+  } catch (err) {
+    const code = err?.code || err?.error?.code;
+    const status = err?.status || err?.response?.status;
+    const msg =
+      err?.response?.data?.error?.message || err?.message || JSON.stringify(err);
+    console.error("❌ Meow OpenAI error detail:", { code, status, msg });
+
+    if (code === "insufficient_quota" || status === 429) {
+      return "喵心今天有點累，但我還是在這裡陪你。要不要先深呼吸一下，再慢慢跟我說？🙂";
+    }
+    return "剛剛喵心有點卡住，可以再跟我說一次嗎？我在這裡聽著。🙂";
+  }
+}
+
+// -------- 共用 fallback --------
 function randomFallback(seed = "") {
   const fallbacks = [
     "我在，先陪你一下。想從哪一段開始說呢？🙂",
@@ -152,6 +212,40 @@ async function sendLineReply(replyToken, text) {
   }
 }
 
+// -------- 喵心 App 用聊天 API --------
+// 只給 /api/chat 用 JSON body，不影響 /line/webhook 的 raw body 驗簽
+app.post("/api/chat", express.json(), async (req, res) => {
+  try {
+    const { userId, message, mood } = req.body || {};
+
+    if (!message || typeof message !== "string") {
+      return res.status(400).json({ error: "message is required" });
+    }
+
+    const userText = message.slice(0, 1000);
+    console.log("💬 [App] 使用者：", userText, "mood:", mood, "userId:", userId);
+
+    const replyText = await askMeow(userText);
+    console.log("🧠 [App] Meow =", replyText);
+
+    // TODO 之後要接 Firebase / 資料庫的話，在這裡寫入 messages 紀錄：
+    // await db.collection("messages").add({
+    //   userId: userId || null,
+    //   message: userText,
+    //   reply: replyText,
+    //   mood: mood || null,
+    //   createdAt: new Date(),
+    // });
+
+    res.json({ reply: replyText });
+  } catch (err) {
+    console.error("❌ /api/chat Error:", err?.response?.data || err);
+    res.status(500).json({
+      reply: "喵心剛剛有點當機，不過我還在這裡。等一下再跟我說一次好嗎？🙂"
+    });
+  }
+});
+
 // -------- 健康/診斷/直接測 AI --------
 app.get("/", (_req, res) => res.send("Mind Coach Lite OK"));
 
@@ -189,7 +283,7 @@ app.get("/test-ai", async (req, res) => {
         max_tokens: 60,
         temperature: 0.7
       },
-      { timeout: 8000 } // 同樣放第二個參數
+      { timeout: 8000 }
     );
     const ai = r.choices?.[0]?.message?.content?.trim();
     res.json({ ok: true, ai });
